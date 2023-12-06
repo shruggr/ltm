@@ -1,11 +1,14 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
-import { BSV20V2 } from 'scrypt-ord'
+import { BSV20V2, Ordinal } from 'scrypt-ord'
 import {
     assert,
+    bsv,
     ByteString,
+    ContractTransaction,
     hash256,
     int2ByteString,
     method,
+    MethodCallOptions,
     prop,
     PubKeyHash,
     SigHash,
@@ -27,19 +30,17 @@ export class LockToMint extends BSV20V2 {
     lastHeight: bigint
 
     constructor(
-        id: ByteString,
         sym: ByteString,
         max: bigint,
         dec: bigint,
-        supply: bigint,
         multiplier: bigint,
         lockDuration: bigint,
         startHeight: bigint
     ) {
-        super(id, sym, max, dec)
+        super(toByteString(''), sym, max, dec)
         this.init(...arguments)
 
-        this.supply = supply
+        this.supply = max
         this.lockDuration = lockDuration
         this.multiplier = multiplier
         this.lastHeight = startHeight
@@ -51,22 +52,21 @@ export class LockToMint extends BSV20V2 {
     }
 
     @method(SigHash.ANYONECANPAY_ALL)
-    public lockAndRedeem(
+    public redeem(
         lockPkh: PubKeyHash,
         rewardPkh: PubKeyHash,
-        lockAmount: bigint,
-        trailingOutputs: ByteString
+        lockAmount: bigint
     ) {
         // simplify lockup
         assert(
             this.ctx.locktime >= this.lastHeight,
-            'nLocktime cannot be in the past'
+            `nLocktime cannot be in the past ${this.lastHeight} ${this.ctx.locktime}}`
         )
         assert(
             this.ctx.locktime + this.lockDuration < 9437183,
-            'lock until height must be less than 9437183'
+            `lock until height must be less than 9437183, ${this.ctx.locktime} ${this.lockDuration}}`
         )
-        assert(this.ctx.sequence < 0xffffffff, 'must use sequence locktime')
+        assert(this.ctx.sequence < 0xffffffff, `must use sequence < 0xffffffff`)
 
         this.lastHeight = this.ctx.locktime
         const reward = this.calculateReward(lockAmount)
@@ -88,7 +88,7 @@ export class LockToMint extends BSV20V2 {
         )
 
         const outputs: ByteString =
-            stateOutput + lockOutput + rewardOutput + trailingOutputs
+            stateOutput + lockOutput + rewardOutput + this.buildChangeOutput()
         assert(hash256(outputs) == this.ctx.hashOutputs, `invalid outputs hash`)
     }
 
@@ -120,5 +120,74 @@ export class LockToMint extends BSV20V2 {
             )
 
         return Utils.buildOutput(lockScript, lockAmount)
+    }
+
+    static async buildTxForRedeem(
+        current: LockToMint,
+        options: MethodCallOptions<LockToMint>,
+        lockPkh: PubKeyHash,
+        rewardPkh: PubKeyHash,
+        lockAmount: bigint
+    ): Promise<ContractTransaction> {
+        const defaultAddress = await current.signer.getDefaultAddress()
+
+        const next = current.next()
+        next.lastHeight = BigInt(options.lockTime)
+        const reward = current.calculateReward(lockAmount)
+        next.supply = current.supply - reward
+
+        if (current.isGenesis()) {
+            next.id =
+                Ordinal.txId2str(
+                    Buffer.from(current.utxo.txId, 'hex')
+                        .reverse()
+                        .toString('hex')
+                ) +
+                toByteString('_', true) +
+                Ordinal.int2Str(BigInt(current.utxo.outputIndex))
+        }
+
+        const tx = new bsv.Transaction().addInput(current.buildContractInput())
+        tx.inputs[0].sequenceNumber = options.sequence
+
+        tx.nLockTime = Number(options.lockTime)
+        if (next.supply > 0n) {
+            const stateScript =
+                BSV20V2.createTransferInsciption(next.id, next.supply) +
+                Ordinal.removeInsciption(next.getStateScript())
+
+            const stateOutput = Utils.buildOutput(stateScript, 1n)
+            tx.addOutput(
+                bsv.Transaction.Output.fromBufferReader(
+                    new bsv.encoding.BufferReader(
+                        Buffer.from(stateOutput, 'hex')
+                    )
+                )
+            )
+        }
+        const lockUntil = BigInt(options.lockTime) + next.lockDuration
+        const lockOutput = LockToMint.buildLockupOutput(
+            lockPkh,
+            lockAmount,
+            lockUntil
+        )
+        tx.addOutput(
+            bsv.Transaction.Output.fromBufferReader(
+                new bsv.encoding.BufferReader(Buffer.from(lockOutput, 'hex'))
+            )
+        )
+        const rewardOutput = LockToMint.buildTransferOutput(
+            rewardPkh,
+            next.id,
+            reward
+        )
+        tx.addOutput(
+            bsv.Transaction.Output.fromBufferReader(
+                new bsv.encoding.BufferReader(Buffer.from(rewardOutput, 'hex'))
+            )
+        )
+
+        tx.change(options.changeAddress || defaultAddress)
+        return { tx, atInputIndex: 0, nexts: [] }
     }
 }
