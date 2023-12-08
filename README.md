@@ -1,4 +1,6 @@
-# Ltm
+# LTM Smart Contract
+
+An on-chain enforced smart contract that enables locking BSV in exchange for BSV-20 
 
 ## Build
 
