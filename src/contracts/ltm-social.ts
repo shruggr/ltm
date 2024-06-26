@@ -22,6 +22,7 @@ import {
     len,
     method,
     MethodCallOptions,
+    OpCode,
     prop,
     PubKeyHash,
     SigHash,
@@ -79,7 +80,7 @@ export class LockToMintBsv21Social extends BSV20V2 {
         lockPkh: PubKeyHash,
         rewardPkh: PubKeyHash,
         lockAmount: bigint,
-        rewardSuffix: ByteString,
+        opReturnData: ByteString,
         trailingOuts: ByteString
     ) {
         // simplify lockup
@@ -117,10 +118,13 @@ export class LockToMintBsv21Social extends BSV20V2 {
             lockUntil
         )
 
-        const rewardScript =
+        let rewardScript =
             BSV20V2.createTransferInsciption(this.id, reward) +
-            Utils.buildPublicKeyHashScript(rewardPkh) +
-            rewardSuffix
+            Utils.buildPublicKeyHashScript(rewardPkh)
+
+        if (len(opReturnData) > 0) {
+            rewardScript += OpCode.OP_RETURN + opReturnData
+        }
 
         const rewardOutput = Utils.buildOutput(rewardScript, 1n)
 
