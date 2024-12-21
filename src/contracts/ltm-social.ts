@@ -11,7 +11,7 @@
 // Users, services, or end users employing the Smart Contract are strongly advised to conduct their own due diligence, seek legal advice, and comply with applicable laws and regulations before utilizing the Smart Contract. By using the Smart Contract, users, services, or end users acknowledge and agree that it is experimental, unaudited, and that they are solely responsible for any risks associated with its use.
 // Any service or end user utilizing the Smart Contract must provide a clear and conspicuous disclaimer stating that the Smart Contract is experimental, unaudited, and that its use involves inherent risks.
 
-import { BSV20V2, Ordinal } from 'scrypt-ord'
+import { BSV20V2, ContentType, Ordinal } from 'scrypt-ord'
 import {
     assert,
     bsv,
@@ -19,16 +19,24 @@ import {
     ContractTransaction,
     hash256,
     int2ByteString,
+    len,
     method,
     MethodCallOptions,
+    OpCode,
     prop,
     PubKeyHash,
     SigHash,
+    slice,
     toByteString,
     Utils,
 } from 'scrypt-ts'
 
-export class LockToMintBsv20 extends BSV20V2 {
+export type Field = {
+    id: ByteString
+    value: ByteString
+}
+
+export class LockToMintBsv21Social extends BSV20V2 {
     @prop(true)
     supply: bigint
 
@@ -41,13 +49,17 @@ export class LockToMintBsv20 extends BSV20V2 {
     @prop(true)
     lastHeight: bigint
 
+    @prop(true)
+    public inscBytes: bigint
+
     constructor(
         sym: ByteString,
         max: bigint,
         dec: bigint,
         multiplier: bigint,
         lockDuration: bigint,
-        startHeight: bigint
+        startHeight: bigint,
+        inscBytes: bigint
     ) {
         super(toByteString(''), sym, max, dec)
         this.init(...arguments)
@@ -60,13 +72,16 @@ export class LockToMintBsv20 extends BSV20V2 {
         this.lockDuration = lockDuration
         this.multiplier = multiplier
         this.lastHeight = startHeight
+        this.inscBytes = inscBytes
     }
 
     @method(SigHash.ANYONECANPAY_ALL)
     public redeem(
         lockPkh: PubKeyHash,
         rewardPkh: PubKeyHash,
-        lockAmount: bigint
+        lockAmount: bigint,
+        opReturnData: ByteString,
+        trailingOuts: ByteString
     ) {
         // simplify lockup
         assert(
@@ -84,23 +99,41 @@ export class LockToMintBsv20 extends BSV20V2 {
         const supply = this.supply - reward
         this.supply = supply
         let stateOutput = toByteString('')
+
         if (supply > 0n) {
-            stateOutput = this.buildStateOutputFT(supply)
+            if (this.isGenesis()) {
+                this.initId()
+                const stateScript =
+                    BSV20V2.createTransferInsciption(this.id, supply) +
+                    slice(this.getStateScript(), this.inscBytes)
+                stateOutput = Utils.buildOutput(stateScript, 1n)
+            } else {
+                stateOutput = this.buildStateOutputFT(supply)
+            }
         }
         const lockUntil = this.ctx.locktime + this.lockDuration
-        const lockOutput = LockToMintBsv20.buildLockupOutput(
+        const lockOutput = LockToMintBsv21Social.buildLockupOutput(
             lockPkh,
             lockAmount,
             lockUntil
         )
-        const rewardOutput = LockToMintBsv20.buildTransferOutput(
-            rewardPkh,
-            this.id,
-            reward
-        )
+
+        let rewardScript =
+            BSV20V2.createTransferInsciption(this.id, reward) +
+            Utils.buildPublicKeyHashScript(rewardPkh)
+
+        if (len(opReturnData) > 0) {
+            rewardScript += OpCode.OP_RETURN + opReturnData
+        }
+
+        const rewardOutput = Utils.buildOutput(rewardScript, 1n)
 
         const outputs: ByteString =
-            stateOutput + lockOutput + rewardOutput + this.buildChangeOutput()
+            stateOutput +
+            lockOutput +
+            rewardOutput +
+            trailingOuts +
+            this.buildChangeOutput()
         assert(
             hash256(outputs) === this.ctx.hashOutputs,
             `invalid outputs hash`
@@ -137,12 +170,57 @@ export class LockToMintBsv20 extends BSV20V2 {
         return Utils.buildOutput(lockScript, lockAmount)
     }
 
+    static async post(
+        providerOrSigner,
+        sym: string,
+        max: bigint,
+        dec: bigint,
+        multiplier: bigint,
+        lockDuration: bigint,
+        currentBlockHeight: bigint,
+        fields: Field[] = []
+    ): Promise<LockToMintBsv21Social> {
+        const content = JSON.stringify({
+            p: 'bsv-20',
+            op: 'deploy+mint',
+            sym,
+            amt: max.toString().replace(/n/, ''),
+            dec: dec.toString().replace(/n/, ''),
+        })
+        let asm = `OP_FALSE OP_IF ${toByteString(
+            'ord',
+            true
+        )} OP_1 ${toByteString(ContentType.BSV20, true)} `
+        fields.forEach((field) => (asm += `${field.id} ${field.value} `))
+        asm += `OP_0 ${toByteString(content, true)} OP_ENDIF`
+        // console.log(asm)
+
+        const inscription = bsv.Script.fromASM(asm)
+        const instance = new LockToMintBsv21Social(
+            toByteString(sym, true),
+            max,
+            dec,
+            multiplier,
+            lockDuration,
+            currentBlockHeight,
+            len(toByteString(inscription.toHex()))
+        )
+        await instance.connect(providerOrSigner)
+
+        instance.prependNOPScript(inscription)
+
+        await instance.deploy(1)
+        // console.log(resp.serialize())
+        return instance
+    }
+
     static async buildTxForRedeem(
-        current: LockToMintBsv20,
-        options: MethodCallOptions<LockToMintBsv20>,
+        current: LockToMintBsv21Social,
+        options: MethodCallOptions<LockToMintBsv21Social>,
         lockPkh: PubKeyHash,
         rewardPkh: PubKeyHash,
-        lockAmount: bigint
+        lockAmount: bigint,
+        trailingOuts: ByteString
     ): Promise<ContractTransaction> {
         const defaultAddress = await current.signer.getDefaultAddress()
 
@@ -181,7 +259,7 @@ export class LockToMintBsv20 extends BSV20V2 {
             )
         }
         const lockUntil = BigInt(options.lockTime!) + next.lockDuration
-        const lockOutput = LockToMintBsv20.buildLockupOutput(
+        const lockOutput = LockToMintBsv21Social.buildLockupOutput(
             lockPkh,
             lockAmount,
             lockUntil
@@ -191,7 +269,7 @@ export class LockToMintBsv20 extends BSV20V2 {
                 new bsv.encoding.BufferReader(Buffer.from(lockOutput, 'hex'))
             )
         )
-        const rewardOutput = LockToMintBsv20.buildTransferOutput(
+        const rewardOutput = LockToMintBsv21Social.buildTransferOutput(
             rewardPkh,
             next.id,
             reward
@@ -201,6 +279,16 @@ export class LockToMintBsv20 extends BSV20V2 {
                 new bsv.encoding.BufferReader(Buffer.from(rewardOutput, 'hex'))
             )
         )
+
+        if (len(trailingOuts) > 0) {
+            const br = new bsv.encoding.BufferReader(
+                Buffer.from(trailingOuts, 'hex')
+            )
+            while (br.remaining() > 0) {
+                const output = bsv.Transaction.Output.fromBufferReader(br)
+                tx.addOutput(output)
+            }
+        }
 
         tx.change(options.changeAddress || defaultAddress)
         return { tx, atInputIndex: 0, nexts: [] }
